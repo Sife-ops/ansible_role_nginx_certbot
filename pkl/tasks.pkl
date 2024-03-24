@@ -1,0 +1,183 @@
+module tasks
+
+import "@ansipkl/AnsibleBuiltin.pkl" as Ab
+import "@ansipkl/CommunityDocker.pkl" as Cd
+import "@ansipkl/Playbook.pkl" as P
+
+main = P.NewRole(new Listing {
+    new Ab.SetFact {
+        options_mixin {
+            hasProfile = "{{ hostvars[inventory_hostname][profile] is defined }}"
+        }
+    }.Task()
+
+    // new Ab.MetaTask {
+    //     `ansible.builtin.meta` = "end_host"
+    //     `when` = "not hasProfile"
+    // }
+
+    new P.Block {
+        `when` = "not hasProfile"
+        block {
+            new Ab.SetFact {
+                options_mixin {
+                    params = "{{ hostvars[inventory_hostname][profile] }}"
+                }
+            }.Task()
+
+            // - name: set params
+            //   debug:
+            //     var: params
+
+            new Ab.File {
+                name = "make nginx files"
+                options {
+                    state = "directory"
+                    path = "/root/nginx_certbot_{{ params.server_name }}/nginx"
+                }
+            }.Task()
+
+            new Ab.Copy {
+                name = "copy nginx_certbot config"
+                options {
+                    dest = "/root/nginx_certbot_{{ params.server_name }}/nginx/default.conf"
+                    content = """
+                    server {
+                        listen 80;
+                        server_name {{ params.server_name }};
+                        location ~ /.well-known/acme-challenge {
+                            allow all;
+                            root /usr/share/nginx/html/letsencrypt;
+                        }
+                    }
+                    """
+                }
+            }.Task()
+
+            new Ab.File {
+                name = "make dhparam files"
+                options {
+                    state = "directory"
+                    path = "/root/nginx_certbot_{{ params.server_name }}/dhparam"
+                }
+            }.Task()
+
+            new Ab.Stat {
+                name = "stat dhparam files"
+                options {
+                    path = "/root/nginx_certbot_{{ params.server_name }}/dhparam/dhparam-2048.pem"
+                }
+                register = "dhparam"
+            }.Task()
+
+            new Ab.Shell {
+                name = "make dhparam files"
+                options {
+                    chdir = "/root/nginx_certbot_{{ params.server_name }}/dhparam"
+                    cmd = "openssl dhparam -out ./dhparam-2048.pem 2048"
+                }
+                `when` = "not dhparam.stat.exists"
+            }.Task()
+
+            new Ab.File {
+                name = "make certbot files (conf)"
+                options {
+                    state = "directory"
+                    path = "/root/nginx_certbot_{{ params.server_name }}/certbot/conf"
+                }
+            }.Task()
+
+            new Ab.File {
+                name = "make certbot files (data)"
+                options {
+                    state = "directory"
+                    path = "/root/nginx_certbot_{{ params.server_name }}/certbot/data"
+                }
+            }.Task()
+
+            new Ab.Stat {
+                name = "stat cert files"
+                options {
+                    path = "/root/nginx_certbot_{{ params.server_name }}/certbot/conf/live/{{ params.server_name }}/fullchain.pem"
+                }
+                register = "cert"
+            }.Task()
+
+            new Cd.DockerContainer {
+                name = "nginx docker"
+                options {
+                    name = "nginx_certbot_web"
+                    image = "nginx:stable-alpine"
+                    image_name_mismatch = "ignore"
+                    state = "started"
+                    restart = true
+                    volumes {
+                      "/root/nginx_certbot_{{ params.server_name }}/nginx:/etc/nginx/conf.d"
+                      "/root/nginx_certbot_{{ params.server_name }}/dhparam:/etc/nginx/dhparam"
+                      "/root/nginx_certbot_{{ params.server_name }}/certbot/conf:/etc/nginx/ssl"
+                      "/root/nginx_certbot_{{ params.server_name }}/certbot/data:/usr/share/nginx/html/letsencrypt"
+                    }
+                }
+                options_mixin {
+                    ports {
+                      "80:80"
+                      "443:443"
+                    }
+                }
+                `when` = "not cert.stat.exists"
+            }.Task()
+
+            new Ab.WaitFor {
+                name = "wait for nginx docker to start"
+                options {
+                    host = "127.0.0.1"
+                    port = 80
+                }
+                `when` = "not cert.stat.exists"
+            }.Task()
+
+            new Cd.DockerContainer {
+                name = "certbot docker"
+                options {
+                    name = "nginx_certbot_letsencrypt"
+                    image = "certbot/certbot:latest"
+                    image_name_mismatch = "ignore"
+                    state = "started"
+                    command = "certonly --webroot --webroot-path=/usr/share/nginx/html/letsencrypt --email {{ params.certbot_email }} --agree-tos --no-eff-email -d {{ params.server_name }}"
+                    volumes {
+                      "/root/nginx_certbot_{{ params.server_name }}/certbot/conf:/etc/letsencrypt"
+                      "/root/nginx_certbot_{{ params.server_name }}/certbot/logs:/var/log/letsencrypt"
+                      "/root/nginx_certbot_{{ params.server_name }}/certbot/data:/usr/share/nginx/html/letsencrypt"
+                    }
+                }
+                `when` = "not cert.stat.exists"
+            }.Task()
+
+            new Ab.WaitFor {
+                name = "wait for certbot to finish"
+                options {
+                    path = "/root/nginx_certbot_{{ params.server_name }}/certbot/conf/live/matrix.goettsch.xyz/fullchain.pem"
+                    // path: "/root/nginx_certbot_{{ params.server_name }}/certbot/conf/live/matrix.goettsch.xyz/privkey.pem"
+                }
+                `when` = "not cert.stat.exists"
+            }.Task()
+
+            new Cd.DockerContainer {
+                name = "stop containers"
+                options {
+                    name = "nginx_certbot_letsencrypt"
+                    state = "stopped"
+                }
+            }.Task()
+
+            new Cd.DockerContainer {
+                name = "stop containers"
+                options {
+                    name = "nginx_certbot_web"
+                    state = "stopped"
+                }
+            }.Task()
+        }
+    }
+})
+

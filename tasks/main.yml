@@ -1,0 +1,93 @@
+---
+- ansible.builtin.set_fact:
+    hasProfile: '{{ hostvars[inventory_hostname][profile] is defined }}'
+- block:
+  - ansible.builtin.set_fact:
+      params: '{{ hostvars[inventory_hostname][profile] }}'
+  - name: make nginx files
+    ansible.builtin.file:
+      path: /root/nginx_certbot_{{ params.server_name }}/nginx
+      state: directory
+  - name: copy nginx_certbot config
+    ansible.builtin.copy:
+      content: |-
+        server {
+            listen 80;
+            server_name {{ params.server_name }};
+            location ~ /.well-known/acme-challenge {
+                allow all;
+                root /usr/share/nginx/html/letsencrypt;
+            }
+        }
+      dest: /root/nginx_certbot_{{ params.server_name }}/nginx/default.conf
+  - name: make dhparam files
+    ansible.builtin.file:
+      path: /root/nginx_certbot_{{ params.server_name }}/dhparam
+      state: directory
+  - name: stat dhparam files
+    register: dhparam
+    ansible.builtin.stat:
+      path: /root/nginx_certbot_{{ params.server_name }}/dhparam/dhparam-2048.pem
+  - name: make dhparam files
+    when: not dhparam.stat.exists
+    ansible.builtin.shell:
+      chdir: /root/nginx_certbot_{{ params.server_name }}/dhparam
+      cmd: openssl dhparam -out ./dhparam-2048.pem 2048
+  - name: make certbot files (conf)
+    ansible.builtin.file:
+      path: /root/nginx_certbot_{{ params.server_name }}/certbot/conf
+      state: directory
+  - name: make certbot files (data)
+    ansible.builtin.file:
+      path: /root/nginx_certbot_{{ params.server_name }}/certbot/data
+      state: directory
+  - name: stat cert files
+    register: cert
+    ansible.builtin.stat:
+      path: /root/nginx_certbot_{{ params.server_name }}/certbot/conf/live/{{ params.server_name }}/fullchain.pem
+  - name: nginx docker
+    when: not cert.stat.exists
+    community.docker.docker_container:
+      image: nginx:stable-alpine
+      image_name_mismatch: ignore
+      name: nginx_certbot_web
+      restart: true
+      state: started
+      volumes:
+      - /root/nginx_certbot_{{ params.server_name }}/nginx:/etc/nginx/conf.d
+      - /root/nginx_certbot_{{ params.server_name }}/dhparam:/etc/nginx/dhparam
+      - /root/nginx_certbot_{{ params.server_name }}/certbot/conf:/etc/nginx/ssl
+      - /root/nginx_certbot_{{ params.server_name }}/certbot/data:/usr/share/nginx/html/letsencrypt
+      ports:
+      - 80:80
+      - 443:443
+  - name: wait for nginx docker to start
+    when: not cert.stat.exists
+    ansible.builtin.wait_for:
+      host: 127.0.0.1
+      port: 80
+  - name: certbot docker
+    when: not cert.stat.exists
+    community.docker.docker_container:
+      command: certonly --webroot --webroot-path=/usr/share/nginx/html/letsencrypt --email {{ params.certbot_email }} --agree-tos --no-eff-email -d {{ params.server_name }}
+      image: certbot/certbot:latest
+      image_name_mismatch: ignore
+      name: nginx_certbot_letsencrypt
+      state: started
+      volumes:
+      - /root/nginx_certbot_{{ params.server_name }}/certbot/conf:/etc/letsencrypt
+      - /root/nginx_certbot_{{ params.server_name }}/certbot/logs:/var/log/letsencrypt
+      - /root/nginx_certbot_{{ params.server_name }}/certbot/data:/usr/share/nginx/html/letsencrypt
+  - name: wait for certbot to finish
+    when: not cert.stat.exists
+    ansible.builtin.wait_for:
+      path: /root/nginx_certbot_{{ params.server_name }}/certbot/conf/live/matrix.goettsch.xyz/fullchain.pem
+  - name: stop containers
+    community.docker.docker_container:
+      name: nginx_certbot_letsencrypt
+      state: stopped
+  - name: stop containers
+    community.docker.docker_container:
+      name: nginx_certbot_web
+      state: stopped
+  when: not hasProfile
